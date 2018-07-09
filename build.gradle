@@ -1,0 +1,165 @@
+//Note: this section 'buildscript` is only for the dependencies of the buildscript itself.
+// See the second 'repositories' section below for the actual dependencies of GATK itself
+buildscript {
+    repositories {
+        mavenCentral()
+        jcenter() // for shadow plugin
+     }
+}
+
+
+plugins {
+    id "java"           // set up default java compile and test tasks
+    id "application"    // provides installDist
+    id 'maven'          // record code coverage during test execution
+    id "com.github.johnrengelman.shadow" version "1.2.3"    //used to build the shadow and sparkJars
+}
+
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import javax.tools.ToolProvider;
+
+mainClassName = "repro_package.Main"
+
+
+//Delete the windows script - we never test on Windows so let's not pretend it works
+startScripts {
+    doLast {
+        delete windowsScript
+    }
+}
+
+
+repositories {
+    mavenCentral()
+    mavenLocal()
+}
+
+final sparkVersion = System.getProperty('spark.version', '2.0.2')
+
+//NOTE: we ignore contracts for now
+compileJava {
+  options.compilerArgs = ['-proc:none', '-Xlint:all','-Werror', '-Xdiags:verbose']
+}
+
+// Dependency change for including MLLib
+configurations {
+    compile.exclude module: 'jul-to-slf4j'
+    compile.exclude module: 'javax.servlet'
+    compile.exclude module: 'servlet-api'
+    compile.exclude group: 'com.esotericsoftware.kryo'
+
+    externalSourceConfiguration {
+        // External sources we need for doc and tab completion generation tasks (i.e., Picard sources)
+        transitive false
+    }
+
+    sparkConfiguration {
+        extendsFrom runtime
+        // exclude Hadoop and Spark dependencies, since they are provided when running with Spark
+        // (ref: http://unethicalblogger.com/2015/07/15/gradle-goodness-excluding-depends-from-shadow.html)
+        exclude group: 'org.apache.hadoop'
+        exclude module: 'spark-core_2.11'
+        exclude group: 'org.slf4j'
+        exclude module: 'jul-to-slf4j'
+        exclude module: 'javax.servlet'
+        exclude module: 'servlet-api'
+        exclude group: 'com.esotericsoftware.kryo'
+        exclude module: 'spark-mllib_2.11'
+        exclude group: 'org.scala-lang'
+        exclude module: 'kryo'
+    }
+}
+
+// Get the jdk files we need to run javaDoc. We need to use these during compile, testCompile,
+// test execution, and gatkDoc generation, but we don't want them as part of the runtime
+// classpath and we don't want to redistribute them in the uber jar.
+final javadocJDKFiles = files(((URLClassLoader) ToolProvider.getSystemToolClassLoader()).getURLs())
+
+dependencies {
+    // javadoc utilities; compile/test only to prevent redistribution of sdk jars
+    compileOnly(javadocJDKFiles)
+    testCompile(javadocJDKFiles)
+
+    // works
+    //compile 'com.google.cloud:google-cloud-nio:0.20.4-alpha-20170727.190814-1:shaded'
+    // works
+    //compile 'com.google.cloud:google-cloud-nio:0.20.0-alpha:shaded'
+    // works (last known good)
+    //compile 'com.google.cloud:google-cloud-nio:0.22.0-alpha:shaded'
+    // does not work (but should)
+    //compile 'com.google.cloud:google-cloud-nio:0.23.0-alpha:shaded'
+    // does not work (but should)
+    //compile 'com.google.cloud:google-cloud-nio:0.23.1-alpha:shaded'
+    // latest version
+    compile 'com.google.cloud:google-cloud-nio:0.53.0-alpha:shaded'
+
+    compile 'org.ojalgo:ojalgo:39.0'
+    compile ('org.apache.spark:spark-mllib_2.11:' + sparkVersion) {
+        // JUL is used by Google Dataflow as the backend logger, so exclude jul-to-slf4j to avoid a loop
+        exclude module: 'jul-to-slf4j'
+        exclude module: 'javax.servlet'
+        exclude module: 'servlet-api'
+    }
+}
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+version = "1.0"
+
+logger.info("build for version:" + version)
+group = 'repro_package'
+
+
+tasks.withType(Jar) {
+    manifest {
+        attributes 'Implementation-Title': 'nio-auth-repro',
+                'Implementation-Version': version,
+                'Main-Class': project.mainClassName
+    }
+}
+
+task wrapper(type: Wrapper) {
+    gradleVersion = '3.1'
+}
+
+tasks.withType(ShadowJar) {
+    from(project.sourceSets.main.output)
+    baseName = project.name + '-package'
+    mergeServiceFiles()
+    relocate 'com.google.common', 'org.nio-auth-repro.relocated.com.google.common'
+    zip64 true
+    exclude 'log4j.properties' // from adam jar as it clashes with hellbender's log4j2.xml
+    exclude '**/*.SF' // these are Manifest signature files and
+    exclude '**/*.RSA' // keys which may accidentally be imported from other signed projects and then fail at runtime
+
+    // Suggested by the akka devs to make sure that we do not get the spark configuration error.
+    // http://doc.akka.io/docs/akka/snapshot/general/configuration.html#When_using_JarJar__OneJar__Assembly_or_any_jar-bundler
+    transform(com.github.jengelman.gradle.plugins.shadow.transformers.AppendingTransformer) {
+        resource = 'reference.conf'
+    }
+}
+
+
+
+shadowJar {
+    configurations = [project.configurations.runtime]
+    classifier = 'local'
+    mergeServiceFiles('reference.conf')
+}
+
+task localJar{ dependsOn shadowJar }
+
+task sparkJar(type: ShadowJar) {
+    group = "Shadow"
+    description = "Create a combined jar of project and runtime dependencies that excludes provided spark dependencies"
+    configurations = [project.configurations.sparkConfiguration]
+    classifier = 'spark'
+}
+
+
+
+task installSpark{ dependsOn sparkJar }
+task installAll{  dependsOn installSpark, installDist }
+
+defaultTasks 'sparkJar'
